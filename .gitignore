@@ -1,0 +1,8 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/pmuc-expression.db
+mucrosquamatus-networks_cache/
+mucrosquamatus-networks_files/
+permutedStats-actualModules.RData

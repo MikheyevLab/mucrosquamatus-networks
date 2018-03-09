@@ -1,0 +1,227 @@
+---
+title: "mucrosquamatus networks"
+author: "Sasha Mikheyev"
+date: "11/24/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+```{r message=FALSE}
+library(tidyverse)
+library(RSQLite)
+library(edgeR)
+library(WGCNA)
+library(DESeq2)
+library(flashClust)
+```
+
+## Including Plots
+
+## Quality control
+ERCC92 was added to the RNA-seq libraries for quality checking
+```{r qc}
+fmt <- function() function(x) as.character(round(x,2))
+
+rsem <- read_csv("data/rsem.csv.gz", col_types = "ccnncnccc")
+ercc <- read_csv("data/ercc.csv.gz", col_types = cols())
+
+ggplot(ercc, aes(conc, tpm, color=library, group=library))+geom_point()+scale_x_continuous(labels = fmt(),trans="log2")+ scale_y_continuous(labels = fmt(),trans="log2")+theme_bw()+ xlab("Spike-in concentration (attamol/ul)")+ylab("Spike-in TPM") + geom_hline(yintercept = .05, color = "red")+guides(color=F)
+```
+
+There is generally good log-linear response between observed and expected values, though we can't detect anything lower than 0.05 TPM. Looks like one library got less spike in than the rest.
+
+```{r}
+factors <- read_csv("data/factors.csv", col_types = cols()) %>% filter(tissue == "venom gland")
+
+rsemVenom <- rsem[grepl('Pm_\\d+$', rsem$library),]
+
+# remove low expressed loci
+keep <- rsemVenom %>% group_by(gene) %>% summarize(tpm = mean(tpm)) %>% filter(tpm>0.05) %>% select(gene) # genes to keep
+
+tpmVenom <- rsemVenom %>% select(library, gene, count, description, class) %>% filter(gene %in% keep$gene) %>%  spread(key = library, value = count)  %>%  remove_rownames %>% column_to_rownames("gene")
+
+# do differential gene expression on venom components only
+
+countsVenom <- rsemVenom %>% filter(!is.na(class)) %>% select(library, gene, count) %>%  spread(key = library, value = count) %>% 
+  remove_rownames %>% column_to_rownames("gene")
+
+
+#design matrix
+design <- model.matrix(~factor(day)+factor(sex)+0, factors)
+rownames(design) <- rownames(factors)
+
+dge <- DGEList(countsVenom)
+dge <- calcNormFactors(dge)
+dat <- estimateGLMCommonDisp(dge, design)
+dat <- estimateGLMTrendedDisp(dat, design)
+dat <- estimateGLMTagwiseDisp(dat, design)
+fit <- glmFit(dat,design)
+
+mds <- plotMDS(dge)
+mdsPlot <- data.frame(mds1=mds$cmdscale.out[,1], mds2=mds$cmdscale.out[,2], ID=rownames(mds$cmdscale.out),days=factors$day,sex=factors$sex,mass=factors$mass)
+ggplot(mdsPlot,aes(mds1,mds2,size=mass,shape=sex,color=as.factor(days)))+geom_point()+my_theme()+scale_colour_grey(start=0.8, end = 0)
+
+
+maleVsfemale <- glmLRT(fit,coef=5)  
+summary(caste.de <- decideTestsDGE(maleVsfemale, p=0.05, adjust="BH"))
+ggplot(na.omit(subset(rsem, tissue == "venom gland")), aes(class,tpm, group=sex)) + scale_y_log10()+ stat_summary(fun.data = "mean_cl_boot", position = position_dodge(width = .75), aes(colour = sex))
+
+t.test(mass~sex,factors)
+t.test(svl~sex,factors)
+
+```
+
+```{r wgcna_soft_threshold, cache=TRUE}
+soft_threshold <- function(data) {
+  disableWGCNAThreads()
+  # Choose a set of soft-thresholding powers, given a WGCNA data object
+  powers = c(seq(from = 10, to=16, by=1))
+  # Call the network topology analysis function
+  sft = pickSoftThreshold(data, powerVector = powers, verbose = 5,networkType = "signed")
+  # Plot the results:
+  sizeGrWindow(9, 5)
+  par(mfrow = c(1,2));
+  cex1 = 0.9;
+  # Scale-free topology fit index as a function of the soft-thresholding power
+  plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+       xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+      main = paste("Scale independence"));
+  text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+      labels=powers,cex=cex1,col="red");
+  # this line corresponds to using an R^2 cut-off of h
+  abline(h=0.90,col="red")
+  # Mean connectivity as a function of the soft-thresholding power
+  plot(sft$fitIndices[,1], sft$fitIndices[,5],
+      xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+      main = paste("Mean connectivity"))
+  text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+  par(mfrow = c(1,1));
+    
+}
+
+# filter data and plot soft threshold parameters
+datExpr <- t(rlog(as.matrix(round(tpmVenom %>% select(-c(Pm_7, description, class))))))
+soft_threshold(datExpr)
+```
+
+We'll choose soft thresholding power 13, as the smalles that crosses the 0.9 threshold. 
+
+```{r WGCNA}
+enableWGCNAThreads()
+wgcna_adjacency <- function(datExpr, threshold, minModuleSize=30, MEDissThres = 0.2, deepSplit = 2) {
+  # takes WGNCA data expression matrix, a soft threshold
+  # optionally minimum module size, module eigengene dissimilarity threshold, and splitting threthold
+  # returns adjacency matrix, module eigengenes and a data frame of colors 
+  
+  #compute adjacency
+  adjacency <- adjacency(datExpr, power = threshold,type="signed")
+  TOM <- TOMsimilarity(adjacency,TOMType="signed")
+  
+  geneTree <- flashClust(as.dist(1-TOM), method = "average");
+  # Module identification using dynamic tree cut:
+  dynamicMods <- cutreeDynamic(dendro = geneTree, distM = 1-TOM, deepSplit = 2, pamRespectsDendro = FALSE, minClusterSize = minModuleSize);
+  table(dynamicMods)
+  dynamicColors = labels2colors(dynamicMods)
+  
+  # Calculate eigengenes
+  MEList = moduleEigengenes(datExpr, colors = dynamicColors)
+  MEs = MEList$eigengenes
+  # Calculate dissimilarity of module eigengenes
+  METree = flashClust(as.dist(1-cor(MEs)), method = "average");
+  plot(METree, main = "Clustering of module eigengenes",xlab = "", sub = "")
+  # Plot the cut line into the dendrogram
+  abline(h=MEDissThres, col = "red")
+  
+  merge <- mergeCloseModules(datExpr, dynamicColors, cutHeight = MEDissThres, verbose = 0)
+  
+  # The merged module colors
+  mergedColors = merge$colors
+  # Eigengenes of the new merged modules:
+  mergedMEs = merge$newMEs
+  
+  # Rename to moduleColors
+  moduleColors = mergedColors
+  # Construct numerical labels corresponding to the colors
+  colorOrder = c("grey", standardColors(50));
+  moduleLabels = match(moduleColors, colorOrder)-1;
+  MEs = mergedMEs;
+  
+  # Recalculate MEs with color labels
+  invisible(MEs0 <- moduleEigengenes(datExpr, moduleColors)$eigengenes)
+  MEs = orderMEs(MEs0)
+  
+  print(table(moduleColors))
+  moduleColors <- as.data.frame(moduleColors)
+  rownames(moduleColors) <- colnames(datExpr)
+  
+  return(list(adjacency=adjacency,MEs=MEs,moduleColors=moduleColors))
+}
+```
+
+```{r cache.rebuild=!file.exists("data/wgcna.rds")}
+plotClusterTreeSamples(datExpr=datExpr)
+results <- wgcna_adjacency(datExpr, 13, MEDissThres = 0.05)
+saveRDS(results, "data/wgcna.rds")
+```
+
+```{r echo=FALSE}
+results <- readRDS("data/wgcna.rds")
+```
+
+## Which modules contain venom genes
+```{r}
+tpmVenom$colors <- results[["moduleColors"]]$moduleColors
+na.omit(tpmVenom) %>% select(description, class, colors) %>% View
+
+```
+
+
+```{r module_trait}
+plotModuleTrait <-function(moduleTraitCor, moduleTraitPvalue,species) {
+  # plot heatmap with module-trait correlation data
+  textMatrix = paste(signif(moduleTraitCor, 2), " (",
+  signif(moduleTraitPvalue, 1), ")", sep = "");
+  dim(textMatrix) = dim(moduleTraitCor)
+  par(mar = c(6, 8.5, 3, 3));
+  # Display the correlation values within a heatmap plot
+  labeledHeatmap(Matrix = moduleTraitCor,
+  xLabels = colnames(moduleTraitCor),
+  yLabels = rownames(moduleTraitCor),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = .5,
+  zlim = c(-1,1),
+  main = paste("Module-trait relationships",species))
+}
+rownames(factors) <- factors$library
+moduleTraitCor = cor(results[["MEs"]], as.numeric(factors[colnames(tpmVenom %>% select(-c(Pm_7, description, class, colors)) ),"day"]), use = "p",method="spearman")
+moduleTraitPvalue <- p.adjust(corPvalueStudent(moduleTraitCor, nSamples=29), method = "fdr")
+print(table(moduleTraitPvalue < 0.05))
+
+ggplot(data.frame(cor=moduleTraitCor,name=rownames(moduleTraitCor),pval=moduleTraitPvalue),aes(x=1,y=name,label=paste(signif(moduleTraitCor, 2), " (", signif(moduleTraitPvalue, 2), ")", sep = "")))+ geom_tile(aes(fill=cor))+ scale_fill_gradient(low = "steelblue",high = "#FF4D4D")+theme_bw()+geom_text()+xlab("")+ylab("")+theme(axis.text.x  = element_blank(),axis.ticks.x  = element_blank())
+```
+
+## Preservation of venom modules in the liver data
+
+```{r eval=F}
+setLabels = c("venom gland", "liver");
+
+tpmLiver <- rsem[grepl('liver', rsem$library),] %>% select(library, gene, count) %>% filter(gene %in% keep$gene) %>%  spread(key = library, value = count)  %>%  remove_rownames %>% column_to_rownames("gene")
+
+datExprLiver <- t(rlog(as.matrix(round(tpmLiver))))
+
+multiExpr <- list(Venom = list(data = datExpr), Liver = list(data = datExprLiver))
+multiColor <- list(Venom = results[["moduleColors"]]$moduleColors)
+
+mpLiver <- modulePreservation(multiExpr, multiColor,
+  referenceNetworks = 1,
+  nPermutations = 200,
+  randomSeed = 1,
+  quickCor = 0,
+  verbose = 3)
+```
