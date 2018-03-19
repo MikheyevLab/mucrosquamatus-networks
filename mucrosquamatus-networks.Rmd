@@ -11,11 +11,9 @@ knitr::opts_chunk$set(cache=TRUE)
 
 ```{r message=FALSE}
 library(tidyverse)
-library(RSQLite)
 library(edgeR)
 library(WGCNA)
 library(DESeq2)
-library(flashClust)
 ```
 
 ## Including Plots
@@ -161,14 +159,13 @@ wgcna_adjacency <- function(datExpr, threshold, minModuleSize=30, MEDissThres = 
 }
 ```
 
-```{r cache.rebuild=!file.exists("data/wgcna.rds")}
-plotClusterTreeSamples(datExpr=datExpr)
+```{r cache=FALSE}
+if (!file.exists("data/wgcna.rds")) {
+  plotClusterTreeSamples(datExpr=datExpr)
 results <- wgcna_adjacency(datExpr, 13, MEDissThres = 0.05)
 saveRDS(results, "data/wgcna.rds")
-```
-
-```{r echo=FALSE}
-results <- readRDS("data/wgcna.rds")
+} else
+  results <- readRDS("data/wgcna.rds")
 ```
 
 ## Which modules contain venom genes

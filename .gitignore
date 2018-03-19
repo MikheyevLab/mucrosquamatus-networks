@@ -3,6 +3,7 @@
 .RData
 .Ruserdata
 data/pmuc-expression.db
+data/wgcna.rds
 mucrosquamatus-networks_cache/
 mucrosquamatus-networks_files/
 permutedStats-actualModules.RData
